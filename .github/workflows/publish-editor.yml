@@ -1,0 +1,65 @@
+name: Publish D3PB editor update
+on:
+  push:
+    branches: [main]
+    paths:
+      - D3_Project_Builder.html
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: d3pb-release
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Build and verify update
+        id: package
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, re, zipfile
+          from pathlib import Path
+          html = Path('D3_Project_Builder.html')
+          data = html.read_bytes()
+          m = re.search(rb"const VERSION='([0-9]+\.[0-9]+\.[0-9]+)'", data)
+          assert m and b'D3 PROJECT BUILDER' in data, 'Invalid editor'
+          v = m.group(1).decode()
+          assert len(data) <= 8 * 1024 * 1024
+          out = Path('dist')
+          out.mkdir()
+          asset = out / 'D3PB_Editor_Update.zip'
+          with zipfile.ZipFile(asset, 'w', zipfile.ZIP_DEFLATED) as z:
+              z.writestr(html.name, data)
+          with zipfile.ZipFile(asset) as z:
+              assert z.testzip() is None and z.read(html.name) == data
+          manifest = {'version': v, 'url': 'https://github.com/' + os.environ['REPO'] + '/releases/download/v' + v + '/' + asset.name, 'sha256': hashlib.sha256(asset.read_bytes()).hexdigest()}
+          (out / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write('version=' + v + '\n')
+          PY
+      - name: Publish new release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release already exists; bump VERSION to publish a new update."
+            exit 0
+          fi
+          latest=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,isDraft,isPrerelease)
+          RELEASES="$latest" python3 - <<'PY'
+          import json, os, re
+          v = tuple(map(int, os.environ['VERSION'].split('.')))
+          versions = [tuple(map(int, r['tagName'][1:].split('.'))) for r in json.loads(os.environ['RELEASES']) if not r['isDraft'] and not r['isPrerelease'] and re.fullmatch(r'v\d+\.\d+\.\d+',r['tagName'])]
+          if versions and v <= max(versions):
+              raise SystemExit('Version must be higher than existing releases')
+          PY
+          gh release create "$tag" dist/D3PB_Editor_Update.zip dist/manifest.json --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "D3 Project Builder $tag" --notes "Automated editor update. Install from D3 Project Builder → Updates." --latest
